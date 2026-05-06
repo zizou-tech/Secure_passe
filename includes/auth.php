@@ -44,6 +44,12 @@ if (isset($_POST['action'])) {
         case 'login':
             handle_login();
             break;
+        case 'forgot_password':
+            handle_forgot_password();
+            break;
+        case 'reset_password':
+            handle_reset_password();
+            break;
         default:
             $_SESSION['error_message'] = "Action non reconnue.";
             header('Location: ../pages/login.php');
@@ -289,3 +295,168 @@ function handle_logout() {
     exit();
 }
 ?>
+// ============================================================
+// MOT DE PASSE OUBLIÉ — Gestion dans le switch
+// ============================================================
+// (Ajoutez 'forgot_password' et 'reset_password' au switch existant)
+// Ces fonctions sont appelées directement ci-dessous.
+
+function handle_forgot_password() {
+    global $link;
+
+    $email = trim($_POST['email'] ?? '');
+
+    if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        $_SESSION['error_message'] = "Adresse email invalide.";
+        header('Location: ../pages/forgot_password.php'); exit();
+    }
+
+    // Rate limiting
+    $rl_key = 'reset_attempts_' . md5($_SERVER['REMOTE_ADDR'] ?? '');
+    if (!isset($_SESSION[$rl_key])) $_SESSION[$rl_key] = ['count'=>0,'time'=>time()];
+    if (time() - $_SESSION[$rl_key]['time'] > 3600) $_SESSION[$rl_key] = ['count'=>0,'time'=>time()];
+    if ($_SESSION[$rl_key]['count'] >= 3) {
+        $_SESSION['error_message'] = "Trop de demandes. Réessayez dans 1 heure.";
+        header('Location: ../pages/forgot_password.php'); exit();
+    }
+    $_SESSION[$rl_key]['count']++;
+
+    // Chercher l'utilisateur (réponse identique que l'email existe ou non = anti-enumeration)
+    $stmt = mysqli_prepare($link, "SELECT id, prenom FROM users WHERE email = ?");
+    mysqli_stmt_bind_param($stmt, 's', $email);
+    mysqli_stmt_execute($stmt);
+    $res  = mysqli_stmt_get_result($stmt);
+    $user = mysqli_fetch_assoc($res);
+    mysqli_stmt_close($stmt);
+
+    if ($user) {
+        // Générer un token sécurisé
+        $token      = bin2hex(random_bytes(32)); // 64 chars hex
+        $token_hash = hash('sha256', $token);    // On stocke le hash
+        $expires    = date('Y-m-d H:i:s', time() + 3600); // 1 heure
+
+        $stmt2 = mysqli_prepare($link,
+            "UPDATE users SET reset_token=?, reset_token_expires=? WHERE id=?");
+        mysqli_stmt_bind_param($stmt2, 'ssi', $token_hash, $expires, $user['id']);
+        mysqli_stmt_execute($stmt2);
+        mysqli_stmt_close($stmt2);
+
+        // Construire le lien
+        $scheme   = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+        $host     = $_SERVER['HTTP_HOST'] ?? 'localhost';
+        $base     = dirname(dirname($_SERVER['PHP_SELF']));
+        $reset_link = "{$scheme}://{$host}{$base}/pages/reset_password.php?token={$token}&email=" . urlencode($email);
+
+        $to      = $email;
+        $subject = "Réinitialisation de votre mot de passe SecurePass";
+        $prenom  = htmlspecialchars($user['prenom']);
+
+        $body = "Bonjour {$prenom},\n\n"
+              . "Vous avez demandé la réinitialisation de votre mot de passe SecurePass.\n\n"
+              . "Cliquez sur le lien ci-dessous pour définir un nouveau mot de passe :\n"
+              . $reset_link . "\n\n"
+              . "Ce lien est valable pendant 1 heure.\n"
+              . "Si vous n'avez pas effectué cette demande, ignorez cet email.\n\n"
+              . "L'équipe SecurePass";
+
+        $html_body = "
+            <div style='font-family:Inter,sans-serif;max-width:560px;margin:0 auto;padding:2rem;'>
+              <div style='text-align:center;margin-bottom:2rem'>
+                <span style='font-size:1.5rem;font-weight:800;color:#667eea'>🔐 SecurePass</span>
+              </div>
+              <div style='background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:2rem;'>
+                <h2 style='color:#2d3748;margin-bottom:1rem'>Réinitialisation de mot de passe</h2>
+                <p style='color:#718096;margin-bottom:1rem'>Bonjour <strong>{$prenom}</strong>,</p>
+                <p style='color:#718096;margin-bottom:1.5rem'>
+                  Vous avez demandé la réinitialisation de votre mot de passe SecurePass.
+                </p>
+                <div style='text-align:center;margin:2rem 0'>
+                  <a href='" . htmlspecialchars($reset_link) . "'
+                     style='display:inline-block;background:linear-gradient(135deg,#667eea,#764ba2);
+                            color:#fff;padding:1rem 2rem;border-radius:8px;text-decoration:none;
+                            font-weight:700;font-size:1rem;'>
+                    Réinitialiser mon mot de passe
+                  </a>
+                </div>
+                <p style='color:#718096;font-size:.85rem;margin-top:1.5rem'>
+                  ⏰ Ce lien expire dans <strong>1 heure</strong>.<br>
+                  Si vous n'avez pas effectué cette demande, ignorez cet email.<br><br>
+                  Lien direct : <a href='" . htmlspecialchars($reset_link) . "' style='color:#667eea;word-break:break-all'>{$reset_link}</a>
+                </p>
+              </div>
+              <p style='text-align:center;color:#a0aec0;font-size:.8rem;margin-top:1rem'>
+                © SecurePass — Gestionnaire de mots de passe sécurisé
+              </p>
+            </div>";
+
+        $headers  = "MIME-Version: 1.0\r\n";
+        $headers .= "Content-Type: text/html; charset=UTF-8\r\n";
+        $headers .= "From: SecurePass <noreply@securepass.local>\r\n";
+        $headers .= "Reply-To: noreply@securepass.local\r\n";
+        $headers .= "X-Mailer: SecurePass/1.0\r\n";
+
+        @mail($to, $subject, $html_body, $headers);
+        // On ne log pas si mail() échoue pour éviter l'enumeration,
+        // mais en dev on peut loguer : error_log("Reset link: $reset_link");
+    }
+
+    // Même réponse qu'il y ait un compte ou non
+    $_SESSION['email_sent'] = true;
+    $_SESSION['success_message'] = "Si cet email est enregistré, vous recevrez un lien de réinitialisation.";
+    header('Location: ../pages/forgot_password.php'); exit();
+}
+
+function handle_reset_password() {
+    global $link;
+
+    $token    = $_POST['token'] ?? '';
+    $email    = trim($_POST['email'] ?? '');
+    $new_pw   = $_POST['new_password'] ?? '';
+    $conf_pw  = $_POST['confirm_password'] ?? '';
+
+    if (empty($token) || empty($email) || empty($new_pw)) {
+        $_SESSION['error_message'] = "Données manquantes.";
+        header("Location: ../pages/reset_password.php?token={$token}&email=" . urlencode($email));
+        exit();
+    }
+
+    if ($new_pw !== $conf_pw) {
+        $_SESSION['error_message'] = "Les mots de passe ne correspondent pas.";
+        header("Location: ../pages/reset_password.php?token={$token}&email=" . urlencode($email));
+        exit();
+    }
+
+    if (strlen($new_pw) < 12 ||
+        !preg_match('/[A-Z]/', $new_pw) || !preg_match('/[a-z]/', $new_pw) ||
+        !preg_match('/\d/', $new_pw)    || !preg_match('/[^a-zA-Z0-9]/', $new_pw)) {
+        $_SESSION['error_message'] = "Le mot de passe doit contenir au moins 12 caractères, une majuscule, un chiffre et un caractère spécial.";
+        header("Location: ../pages/reset_password.php?token={$token}&email=" . urlencode($email));
+        exit();
+    }
+
+    $token_hash = hash('sha256', $token);
+    $stmt = mysqli_prepare($link,
+        "SELECT id FROM users WHERE email = ? AND reset_token = ? AND reset_token_expires > NOW()");
+    mysqli_stmt_bind_param($stmt, 'ss', $email, $token_hash);
+    mysqli_stmt_execute($stmt);
+    mysqli_stmt_store_result($stmt);
+
+    if (mysqli_stmt_num_rows($stmt) === 0) {
+        mysqli_stmt_close($stmt);
+        $_SESSION['error_message'] = "Lien invalide ou expiré. Faites une nouvelle demande.";
+        header('Location: ../pages/forgot_password.php'); exit();
+    }
+    mysqli_stmt_bind_result($stmt, $uid);
+    mysqli_stmt_fetch($stmt);
+    mysqli_stmt_close($stmt);
+
+    $new_hash = password_hash($new_pw, PASSWORD_BCRYPT, ['cost' => 12]);
+    $stmt2 = mysqli_prepare($link,
+        "UPDATE users SET password_hash=?, reset_token=NULL, reset_token_expires=NULL, updated_at=NOW() WHERE id=?");
+    mysqli_stmt_bind_param($stmt2, 'si', $new_hash, $uid);
+    mysqli_stmt_execute($stmt2);
+    mysqli_stmt_close($stmt2);
+
+    $_SESSION['success_message'] = "Mot de passe réinitialisé avec succès ! Vous pouvez maintenant vous connecter.";
+    header('Location: ../pages/login.php'); exit();
+}
